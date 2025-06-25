@@ -232,6 +232,9 @@ def get_mu_and_std(dataloader, N=96, device="cpu"):
     
     t0 = time.time()
     data_iter = iter(dataloader)
+    
+    n=0
+    
     for n in range(len(data_iter)):
         x = next(data_iter)[0].squeeze().to(device)
         _mu = x.mean(dim=0)
@@ -537,10 +540,12 @@ def get_radial_dependence(Gamma, a=4, R=0.5, visualize=True):
 
     if visualize:
         fig, axs = plt.subplots(nrows=1, ncols=2, figsize=(12, 4))
-        axs[0].set_title('Standard Deviation with Masking')
-        axs[1].set_title('Radial Dependence of STD (log-log)')
+        axs[0].set_title(r'$\Gamma_{diag}$ with Masking')
+        axs[1].set_title(r'Radial Dependence of $\Gamma_{diag}$ (log-log)')
         axs[0].imshow(mask_view, vmin=0, vmax=1)
         axs[1].scatter(log_r, log_y, c=colors, s=1)
+        axs[1].set_xlabel(r'$\log(|k|)$')
+        axs[1].set_ylabel(r'$\log(\Gamma_{diag})$')
 
     linear_regression_data = linregress(masked_log_r, masked_log_y)
     Delta = -linear_regression_data.slope/2

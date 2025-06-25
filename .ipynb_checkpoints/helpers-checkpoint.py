@@ -14,10 +14,10 @@ from RealFFT import rfft
 from RealFFT import irfft
 
 def getDevice():
-    if torch.backends.mps.is_available():
-        device = torch.device("mps")
-    elif torch.cuda.is_available():
+    if torch.cuda.is_available():
         device = torch.device("cuda:0")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
     else:
         device = torch.device("cpu")
 
@@ -115,7 +115,7 @@ class NoiseGenerator:
         # 1/dist has a divide by zero error at the center point
         # Save the value of this point and reset it after dividing by distance
         # Note: the value at the center point controls the standard deviation of the mean of the color channels...
-        # ...since we don't need much variation in the mean we are safe by resetting it
+        # ...cropping out the center of the noise image will introduce variation in the overall mean
         Z0 = (A/(Dist**(Delta))) * Z0
         Z0[:,:,M//2, M//2] = 0.0
 
@@ -221,25 +221,40 @@ class NoiseGenerator:
         return sigma_noise
 
      
-def get_mu_and_std(dataset, device="cpu"):
+def get_mu_and_std(dataloader, N=96, device="cpu"):
     """
     Returns the means and standard deviations of the image set as a tuple (means, stds)
     Note: returns the pixel-wise values (mean and std for each pixel) not the total image mean and std. 
     """
 
-    mu = torch.zeros_like(dataset[0][0].squeeze().to(device))
-    std_squared = torch.zeros_like(dataset[0][0].squeeze().to(device))
+    mu = torch.zeros(N,N, device=device)
+    std_squared = torch.zeros_like(mu)
     
-    for n in range(len(dataset)):
-        x = dataset[n][0].squeeze().to(device)
-        mu = (mu*n + x)/(n+1)
+    t0 = time.time()
+    data_iter = iter(dataloader)
+    
+    n=0
+    
+    for n in range(len(data_iter)):
+        x = next(data_iter)[0].squeeze().to(device)
+        _mu = x.mean(dim=0)
+        mu = (mu*n + _mu)/(n+1)
+        if n%50==0:
+            print(f"Calculating mean ... {n}/{len(data_iter)}")
+            clear_output(wait=True)
         
-    for n in range(len(dataset)):
-        x = dataset[n][0].squeeze().to(device)
-        _std_squared = (x-mu)**2
+    data_iter = iter(dataloader)
+    for n in range(len(data_iter)):
+        x = next(data_iter)[0].squeeze().to(device)
+        batch_size = x.shape[0]
+        _std_squared = torch.einsum("bij,bij->ij", x-mu, x-mu)/batch_size
         std_squared = (std_squared*n + _std_squared)/(n+1)
-        
+        if n%50==0:
+            print(f"Calculating standard deviation ... {n}/{len(data_iter)}")
+            clear_output(wait=True)
+    
     std = torch.sqrt(std_squared)
+    print(f"Calculated mean and standard deviation in {time.time()-t0} seconds.")
 
     return mu, std
 
@@ -254,13 +269,46 @@ def denormalize(x, mu, std):
     return x*std.to(device) + mu.to(device)
 
 
-def whiten(x, mu, std, Delta, eps, noise_generator, mu_whitened=None, std_whitened=None):
-    d = noise_generator.dist.to(x.device)
-    x = normalize(x, mu, std)
-    x = irfft(rfft(x)*((d+eps)**(2*Delta)))
+def whiten(x, mu, std, Delta, eps, noise_generator, mu_whitened, std_whitened):
+    """
+    Performs a whitening transformation on the input images.
+    If means and stds are given then it also normalizes (before AND after the whitening t-form)
+    eps: regularizes the distance function so its not precisely zero at the origin (r->r+eps)
+    """
+    device=x.device
+    d = noise_generator.dist.to(device)
+    # First normalize if not already normalized (set mu and std to None if already normalized)
+    if not (mu==None) and not (std==None):
+        x = normalize(x, mu.to(device), std.to(device))
     
+    x = irfft(rfft(x)*((d+eps)**Delta))
+    
+    # Normalize again if the mean and std for the whitened set are known (set to None if not)
+    if not (mu_whitened==None) and not (std_whitened==None):
+        x = normalize(x, mu_whitened.to(device), std_whitened.to(device))
+
+    return x
+
+
+def dewhiten(x, mu, std, Delta, eps, noise_generator, mu_whitened, std_whitened):
+    """
+    Inverts the whitening transformation on the input images.
+    If means and stds are given then it also denormalizes (before AND after the dewhitening t-form)
+    eps: regularizes the distance function so its not precisely zero at the origin (r->r+eps). Usually small (eps~.001). 
+    """
+    device = x.device
+    d = noise_generator.dist.to(device)
+    
+    # First denormalize the whitened images
     if not (mu_whitened == None) and not (std_whitened==None):
-        x = normalize(x, mu_whitened, std_whitened)
+        x = denormalize(x, mu_whitened.to(device), std_whitened.to(device))
+    
+    # Dewhiten in rfft space
+    x = irfft(rfft(x)*((d+eps)**(-Delta)))
+    
+    # Normalize again if the mean and std for the whitened set are known (set to None if not)
+    if not (mu==None) and not (std==None):
+        x = denormalize(x, mu.to(device), std.to(device))
 
     return x
 
@@ -284,18 +332,18 @@ def get_whitened_mu_and_std(dataloader,
     
     data_iter = iter(dataloader)
     for n in range(len(data_iter)):
-        x = next(data_iter)[0].squeeze().to(device)
-        x = whiten(x, mu=mu, std=std, Delta=Delta, eps=eps, noise_generator=noise_generator)
+        x = next(data_iter)[0].to(device)
+        x = whiten(x, mu=mu, std=std, Delta=Delta, eps=eps, noise_generator=noise_generator, mu_whitened=None, std_whitened=None).squeeze()
         _mu_whitened = x.mean(dim=0)
         mu_whitened = (mu_whitened*n + _mu_whitened)/(n+1)
         if n%100==0:
             print(f"Calculating Mean: {n}/{len(data_iter)}")
             clear_output(wait=True)
         
-    data_iter = iter(dataloader) # Fixed
+    data_iter = iter(dataloader)
     for n in range(len(data_iter)):
         x = next(data_iter)[0].to(device)
-        x = whiten(x, mu=mu, std=std, Delta=Delta, eps=eps, noise_generator=noise_generator)
+        x = whiten(x, mu=mu, std=std, Delta=Delta, eps=eps, noise_generator=noise_generator, mu_whitened=None, std_whitened=None).squeeze()
         _std_whitened_squared = torch.einsum("bij,bij->ij", x-mu_whitened, x-mu_whitened)/batch_size
         std_whitened_squared = (std_whitened_squared*n + _std_whitened_squared)/(n+1)
         if n%100==0:
@@ -492,10 +540,12 @@ def get_radial_dependence(Gamma, a=4, R=0.5, visualize=True):
 
     if visualize:
         fig, axs = plt.subplots(nrows=1, ncols=2, figsize=(12, 4))
-        axs[0].set_title('Standard Deviation with Masking')
-        axs[1].set_title('Radial Dependence of STD (log-log)')
+        axs[0].set_title(r'$\Gamma_{diag}$ with Masking')
+        axs[1].set_title(r'Radial Dependence of $\Gamma_{diag}$ (log-log)')
         axs[0].imshow(mask_view, vmin=0, vmax=1)
         axs[1].scatter(log_r, log_y, c=colors, s=1)
+        axs[1].set_xlabel(r'$\log(|k|)$')
+        axs[1].set_ylabel(r'$\log(\Gamma_{diag})$')
 
     linear_regression_data = linregress(masked_log_r, masked_log_y)
     Delta = -linear_regression_data.slope/2
